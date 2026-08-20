@@ -153,6 +153,52 @@ async def test_vertex_credential_resolution_bounds_a_thread_offloaded_refresh():
 
 
 @pytest.mark.asyncio
+async def test_bounded_resolver_keeps_inflight_refresh_alive_on_timeout():
+    """Regression: `asyncio.wait_for` used to cancel the token resolver on
+    timeout, which released VertexBase's per-key async refresh lock while the
+    underlying google-auth refresh thread kept running holding the instance-wide
+    `_sync_refresh_lock`. Router retries would then spawn additional refresh
+    threads that queued on that sync lock and starved anyio's thread limiter.
+    The bounded resolver must let the inflight resolution keep running past the
+    caller's bound so the per-key async lock stays held and later callers
+    (retries or unrelated realtime traffic) queue on the async lock instead of
+    spawning new blocking refresh threads."""
+    started = asyncio.Event()
+
+    async def slow_resolver(credentials, project_id, custom_llm_provider) -> tuple[str, str]:
+        started.set()
+        await asyncio.sleep(30)
+        return "", ""
+
+    before = set(realtime_main._INFLIGHT_VERTEX_TOKEN_TASKS)
+    with pytest.raises(ValueError, match="timed out fetching Google OAuth access token"):
+        await realtime_main._resolve_vertex_access_token_bounded(
+            credentials="fake-credentials",
+            project_id="fake-project",
+            resolver=slow_resolver,
+            timeout_seconds=0.05,
+        )
+    assert started.is_set()
+    new_tasks = realtime_main._INFLIGHT_VERTEX_TOKEN_TASKS - before
+    assert len(new_tasks) == 1
+    inflight = next(iter(new_tasks))
+    try:
+        assert not inflight.done(), (
+            "Bounded resolver ended the inflight token refresh on timeout: "
+            "VertexBase's per-key async lock would be released while the refresh "
+            "thread still holds _sync_refresh_lock, letting retries spawn new "
+            "refresh threads that queue on the sync lock"
+        )
+        assert not inflight.cancelled()
+    finally:
+        inflight.cancel()
+        try:
+            await inflight
+        except BaseException:
+            pass
+
+
+@pytest.mark.asyncio
 async def test_arealtime_vertex_branch_resolves_credentials_under_a_bound(monkeypatch):
     """The wiring half of the regression: the vertex branch of _arealtime must
     go through the bounded resolver, so a hung token refresh surfaces as a

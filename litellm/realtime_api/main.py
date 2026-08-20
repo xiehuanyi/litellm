@@ -299,21 +299,33 @@ async def vertex_access_token_resolver(
     )
 
 
+_INFLIGHT_VERTEX_TOKEN_TASKS: Final[set[asyncio.Task[tuple[str, str]]]] = set()  # mutable-ok: strong-ref registry so bounded resolvers keep running past timeout and keep VertexBase's per-key async refresh lock held; without it retries would spawn new asyncify(refresh_auth) threads that queue on the instance-wide _sync_refresh_lock and starve anyio's thread limiter
+
+
+def _drop_inflight_vertex_token_task(task: asyncio.Task[tuple[str, str]]) -> None:
+    _INFLIGHT_VERTEX_TOKEN_TASKS.discard(task)
+    if not task.cancelled():
+        # Consume the exception so tasks that outlived their bounded caller don't emit "exception was never retrieved" warnings.
+        _ = task.exception()
+
+
 async def _resolve_vertex_access_token_bounded(
     credentials: VERTEX_CREDENTIALS_TYPES | None,
     project_id: str | None,
     resolver: VertexAccessTokenResolver,
     timeout_seconds: float,
 ) -> tuple[str, str]:
-    try:
-        return await asyncio.wait_for(
-            resolver(
-                credentials=credentials,
-                project_id=project_id,
-                custom_llm_provider="vertex_ai",
-            ),
-            timeout=timeout_seconds,
+    task: Final = asyncio.ensure_future(
+        resolver(
+            credentials=credentials,
+            project_id=project_id,
+            custom_llm_provider="vertex_ai",
         )
+    )
+    _INFLIGHT_VERTEX_TOKEN_TASKS.add(task)
+    task.add_done_callback(_drop_inflight_vertex_token_task)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
     except asyncio.TimeoutError as e:
         raise ValueError(
             "Vertex AI realtime: timed out fetching Google OAuth access token after "
